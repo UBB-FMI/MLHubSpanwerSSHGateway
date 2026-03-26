@@ -23,7 +23,6 @@ It accepts inbound SSH connections on the gateway, validates the inbound usernam
 - A trusted `MLHubSpawner` instance able to reach the control port
 - An upstream SSH server reachable from this machine
 - A valid private key file used by the gateway for upstream connections
-- A valid `known_hosts` file for upstream host verification
 
 Install dependencies with:
 
@@ -38,8 +37,7 @@ Start the proxy from the repository root:
 ```bash
 python app.py \
   --control-shared-secret 'replace-me' \
-  --upstream-client-key ~/.ssh/id_ed25519 \
-  --upstream-known-hosts ~/.ssh/known_hosts
+  --upstream-client-key ~/.ssh/id_ed25519
 ```
 
 Optional CLI arguments:
@@ -52,8 +50,7 @@ python app.py \
   --control-listen-host 0.0.0.0 \
   --control-listen-port 2223 \
   --control-shared-secret 'replace-me' \
-  --upstream-client-key ~/.ssh/id_ed25519 \
-  --upstream-known-hosts ~/.ssh/known_hosts
+  --upstream-client-key ~/.ssh/id_ed25519
 ```
 
 Defaults:

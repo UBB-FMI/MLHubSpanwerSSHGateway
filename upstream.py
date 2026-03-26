@@ -14,11 +14,11 @@ class UpstreamConnectionFactory:
     def __init__(
         self,
         client_key_path: str,
-        known_hosts_path: str,
+        known_hosts_path: str = "",
         connect_timeout: int = DEFAULT_CONNECT_TIMEOUT,
     ):
         self._client_key_path = self._require_file(client_key_path, "client key")
-        self._known_hosts_path = self._require_file(known_hosts_path, "known_hosts")
+        self._known_hosts_path = known_hosts_path
         self._connect_timeout = connect_timeout
 
     def _require_file(self, raw_path: str, description: str) -> Path:
@@ -33,7 +33,7 @@ class UpstreamConnectionFactory:
             user.upstream_port,
             username=username,
             client_keys=[str(self._client_key_path)],
-            known_hosts=str(self._known_hosts_path),
+            known_hosts=None,
             config=None,
             public_key_auth=True,
             password_auth=False,

@@ -46,6 +46,64 @@ def test_ssh_exec_succeeds(
     assert target_server.data_file.read_text() == completed.stdout
 
 
+def test_binary_exec_upload_with_stdin(
+    tmp_path: Path,
+    proxy_server,
+    proxy_openssh_env,
+    openssh_common_args,
+    target_server,
+) -> None:
+    payload = bytes(range(256)) * 1024
+    remote_path = f"/tmp/proxy-binary-upload-{int(time.time() * 1000)}.bin"
+
+    completed = subprocess.run(
+        [
+            "ssh",
+            *openssh_common_args,
+            proxy_server.host,
+            f"dd of={remote_path} status=none",
+        ],
+        env=proxy_openssh_env,
+        input=payload,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr.decode("utf-8", errors="replace")
+
+    download = subprocess.run(
+        [
+            "ssh",
+            *openssh_common_args,
+            proxy_server.host,
+            f"cat {remote_path}",
+        ],
+        env=proxy_openssh_env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+
+    assert download.returncode == 0, download.stderr.decode("utf-8", errors="replace")
+    if download.stdout != payload:
+        first_diff = next(
+            (
+                index
+                for index, (left, right) in enumerate(zip(download.stdout, payload))
+                if left != right
+            ),
+            None,
+        )
+        raise AssertionError(
+            "binary upload mismatch: "
+            f"expected_len={len(payload)} actual_len={len(download.stdout)} first_diff={first_diff}"
+        )
+
+
 @pytest.mark.asyncio
 async def test_bad_password_rejected(proxy_server) -> None:
     with pytest.raises(asyncssh.PermissionDenied):
