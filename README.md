@@ -1,6 +1,6 @@
 # MLHubSpawner SSH Gateway
 
-This project is a small SSH proxy built with `asyncssh`.
+This project is a small SSH proxy built with `paramiko`.
 
 It accepts inbound SSH connections on the gateway, validates the inbound username/password against an in-memory registry populated by `MLHubSpawner`, opens a second SSH connection to the registered upstream host using a configured private key, and then relays the SSH session and forwarding requests through that upstream connection.
 
@@ -12,7 +12,7 @@ It accepts inbound SSH connections on the gateway, validates the inbound usernam
 - Keeps username/password/upstream-host mappings in memory only
 - Connects upstream with public-key authentication
 - Relays shell, exec, and subsystem sessions
-- Relays PTY requests, environment variables, terminal resize events, EOF, and signals
+- Relays PTY requests, environment variables, terminal resize events, and EOF
 - Supports direct TCP forwarding and reverse remote port forwarding
 - Drops active SSH sessions and tunnels when a user is unregistered
 - Auto-generates server host keys under `assets/` if they do not exist
@@ -140,5 +140,6 @@ Proxy to upstream server:
 - User definitions are not persisted; gateway access is lost if the gateway or `MLHubSpawner` restarts.
 - Passwords are stored in plaintext in process memory only.
 - Inbound public-key authentication is not supported.
+- SSH client signal relay is not supported.
 - This project does not currently load configuration from environment variables or a config file.
 - This repo contains the gateway implementation only; deployment, systemd service setup, and firewalling are not included.

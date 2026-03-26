@@ -471,6 +471,51 @@ async def test_binary_upload_survives_parallel_probe_channels(proxy_server) -> N
         assert int(size_result.stdout.strip()) == len(payload)
 
 
+@pytest.mark.asyncio
+async def test_large_binary_upload_crosses_window_with_parallel_probe_channels(proxy_server) -> None:
+    remote_path = f"/tmp/proxy-large-parallel-upload-{time.time_ns()}.bin"
+    payload = (bytes(range(256)) * 12288)[:2_621_440]
+
+    async with asyncssh.connect(
+        proxy_server.host,
+        proxy_server.port,
+        username=proxy_server.username,
+        password=proxy_server.password,
+        known_hosts=None,
+        public_key_auth=False,
+        kbdint_auth=False,
+    ) as conn:
+        process = await conn.create_process(f"dd of={remote_path} status=none", encoding=None, send_eof=False)
+
+        async def upload() -> None:
+            chunk_size = 65536
+            for offset in range(0, len(payload), chunk_size):
+                process.stdin.write(payload[offset : offset + chunk_size])
+                await process.stdin.drain()
+                if offset in {262144, 1310720}:
+                    await asyncio.sleep(0.1)
+            process.stdin.write_eof()
+
+        async def probes() -> tuple[asyncssh.SSHCompletedProcess, asyncssh.SSHCompletedProcess]:
+            await asyncio.sleep(0.05)
+            return await asyncio.gather(
+                conn.run("/bin/sh -c 'uname -s || uname -o && uname -m'", check=True),
+                conn.run('cmd /c "set OS & set PROCESSOR_ARCHITECTURE"', check=False),
+            )
+
+        (_, dd_result), (uname_result, cmd_result) = await asyncio.gather(
+            asyncio.gather(upload(), process.wait(check=False)),
+            probes(),
+        )
+
+        assert dd_result.exit_status == 0
+        assert uname_result.stdout.strip().startswith("Linux")
+        assert cmd_result.exit_status == 127
+
+        size_result = await conn.run(f"wc -c < {remote_path}", check=True)
+        assert int(size_result.stdout.strip()) == len(payload)
+
+
 def test_unregister_rejects_new_auth(proxy_server, proxy_openssh_env) -> None:
     response = send_control_request(
         proxy_server.host,
