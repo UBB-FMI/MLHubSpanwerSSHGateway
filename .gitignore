@@ -1,0 +1,4 @@
+__pycache__/
+*.py[cod]
+assets/server-host-key
+assets/server-host-key.rsa
