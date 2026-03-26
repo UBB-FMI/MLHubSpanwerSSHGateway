@@ -3,11 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import asyncssh
-
-try:
-    from .user_auth import UserRecord
-except ImportError:
-    from user_auth import UserRecord
+from user_auth import UserRecord
 
 
 DEFAULT_CONNECT_TIMEOUT = 10

@@ -3,17 +3,10 @@ from __future__ import annotations
 import logging
 
 import asyncssh
-
-try:
-    from .forwarding import RemotePortForwarder
-    from .session import ProxyServerSession
-    from .upstream import UpstreamConnectionFactory
-    from .user_auth import UserAuthError, UserAuthenticator, UserRecord
-except ImportError:
-    from forwarding import RemotePortForwarder
-    from session import ProxyServerSession
-    from upstream import UpstreamConnectionFactory
-    from user_auth import UserAuthError, UserAuthenticator, UserRecord
+from forwarding import RemotePortForwarder
+from session import ProxyServerSession
+from upstream import UpstreamConnectionFactory
+from user_auth import UserAuthError, UserAuthenticator, UserRecord
 
 
 LOG = logging.getLogger(__name__)

@@ -7,13 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import asyncssh
-
-if __package__ in {None, ""}:
-    from host_keys import ServerHostKeyManager
-    from server import ProxyServerFactory
-else:
-    from .host_keys import ServerHostKeyManager
-    from .server import ProxyServerFactory
+from host_keys import ServerHostKeyManager
+from server import ProxyServerFactory
 
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
