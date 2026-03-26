@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
+from threading import RLock
 
 
 class UserAuthError(Exception):
@@ -26,73 +26,98 @@ class UserRecord:
     password: str
     upstream_host: str
     upstream_port: int
-    client_key_path: str
-    known_hosts_path: str
-
-
-# Edit this mapping for real deployments.
-USERS: dict[str, UserRecord] = {
-    "example": UserRecord(
-        password="change-me",
-        upstream_host="192.168.104.119",
-        upstream_port=22,
-        client_key_path="~/.ssh/NOPASS_RSA",
-        known_hosts_path="~/.ssh/known_hosts",
-    ),
-    "root": UserRecord(
-        password="change-me",
-        upstream_host="192.168.104.119",
-        upstream_port=22,
-        client_key_path="~/.ssh/NOPASS_RSA",
-        known_hosts_path="~/.ssh/known_hosts",
-    ),
-}
 
 
 class UserDirectory:
     def __init__(self, users: Mapping[str, UserRecord] | None = None):
-        self._users = USERS if users is None else users
+        self._lock = RLock()
+        self._users = dict(users or {})
+
+    def replace_users(self, users: Mapping[str, UserRecord]) -> None:
+        with self._lock:
+            self._users = dict(users)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._users.clear()
+
+    def snapshot(self) -> dict[str, UserRecord]:
+        with self._lock:
+            return dict(self._users)
+
+    def has_user(self, username: str) -> bool:
+        with self._lock:
+            return username in self._users
+
+    def register_user(self, username: str, user: UserRecord) -> UserRecord:
+        normalized_user = self.validate_user_record(user)
+        with self._lock:
+            self._users[username] = normalized_user
+        return normalized_user
+
+    def unregister_user(self, username: str) -> UserRecord | None:
+        with self._lock:
+            return self._users.pop(username, None)
 
     def get_user(self, username: str) -> UserRecord:
-        try:
-            return self._users[username]
-        except KeyError as exc:
-            raise UnknownUserError(f"unknown SSH user: {username}") from exc
+        with self._lock:
+            try:
+                return self._users[username]
+            except KeyError as exc:
+                raise UnknownUserError(f"unknown SSH user: {username}") from exc
 
     def validate_user_record(self, user: UserRecord) -> UserRecord:
         if not user.upstream_host:
             raise UserConfigError("upstream_host must not be empty")
         if user.upstream_port <= 0 or user.upstream_port > 65535:
             raise UserConfigError("upstream_port must be between 1 and 65535")
-
-        client_key_path = Path(user.client_key_path).expanduser()
-        if not client_key_path.is_file():
-            raise UserConfigError(f"client key does not exist or is not a file: {client_key_path}")
-
-        known_hosts_path = Path(user.known_hosts_path).expanduser()
-        if not known_hosts_path.is_file():
-            raise UserConfigError(f"known_hosts does not exist or is not a file: {known_hosts_path}")
-
         return user
 
 
 class UserAuthenticator:
     def __init__(self, directory: UserDirectory | None = None):
-        self._directory = UserDirectory() if directory is None else directory
+        self._directory = USER_DIRECTORY if directory is None else directory
+
+    def is_known_user(self, username: str) -> bool:
+        return self._directory.has_user(username)
 
     def authenticate(self, username: str, password: str) -> UserRecord:
-        user = self._directory.validate_user_record(self._directory.get_user(username))
+        user = self._directory.get_user(username)
+        self._directory.validate_user_record(user)
         if password != user.password:
             raise InvalidPasswordError(f"invalid password for SSH user: {username}")
         return user
 
 
+USER_DIRECTORY = UserDirectory()
+
+
+def set_users(users: Mapping[str, UserRecord]) -> None:
+    USER_DIRECTORY.replace_users(users)
+
+
+def clear_users() -> None:
+    USER_DIRECTORY.clear()
+
+
+def snapshot_users() -> dict[str, UserRecord]:
+    return USER_DIRECTORY.snapshot()
+
+
+def register_user(username: str, user: UserRecord) -> UserRecord:
+    return USER_DIRECTORY.register_user(username, user)
+
+
+def unregister_user(username: str) -> UserRecord | None:
+    return USER_DIRECTORY.unregister_user(username)
+
+
 def get_user(username: str) -> UserRecord:
-    return UserDirectory().get_user(username)
+    return USER_DIRECTORY.get_user(username)
 
 
 def validate_user_record(user: UserRecord) -> UserRecord:
-    return UserDirectory().validate_user_record(user)
+    return USER_DIRECTORY.validate_user_record(user)
 
 
 def authenticate_user(username: str, password: str) -> UserRecord:
