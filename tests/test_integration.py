@@ -19,6 +19,22 @@ def allocate_port() -> int:
         return int(sock.getsockname()[1])
 
 
+async def _read_until(reader: asyncssh.SSHReader[str], marker: str, timeout: float = 5.0) -> str:
+    chunks: list[str] = []
+    deadline = time.monotonic() + timeout
+
+    while time.monotonic() < deadline:
+        chunk = await asyncio.wait_for(reader.read(4096), timeout=deadline - time.monotonic())
+        if not chunk:
+            raise AssertionError(f"stream closed before marker {marker!r} was seen; received={''.join(chunks)!r}")
+        chunks.append(chunk)
+        joined = "".join(chunks)
+        if marker in joined:
+            return joined
+
+    raise AssertionError(f"timed out waiting for marker {marker!r}; received={''.join(chunks)!r}")
+
+
 def test_ssh_exec_succeeds(
     proxy_server,
     proxy_openssh_env,
@@ -340,6 +356,119 @@ async def test_multiple_channels_share_one_connection(proxy_server) -> None:
 
     assert first.stdout == "first"
     assert second.stdout == "second"
+
+
+@pytest.mark.asyncio
+async def test_interactive_shell_survives_parallel_execs(proxy_server) -> None:
+    async with asyncssh.connect(
+        proxy_server.host,
+        proxy_server.port,
+        username=proxy_server.username,
+        password=proxy_server.password,
+        known_hosts=None,
+        public_key_auth=False,
+        kbdint_auth=False,
+    ) as conn:
+        process = await conn.create_process(term_type="xterm", encoding="utf-8")
+
+        ready_marker = f"shell-ready-{time.time_ns()}"
+        process.stdin.write(f"printf '{ready_marker}\\n'\n")
+        await process.stdin.drain()
+        await _read_until(process.stdout, ready_marker)
+
+        first, second = await asyncio.gather(
+            conn.run("printf first", check=True, term_type="xterm"),
+            conn.run("printf second", check=True, term_type="xterm"),
+        )
+
+        assert first.stdout == "first"
+        assert second.stdout == "second"
+
+        after_marker = f"shell-after-{time.time_ns()}"
+        process.stdin.write(f"printf '{after_marker}\\n'\nexit\n")
+        await process.stdin.drain()
+        shell_output = await _read_until(process.stdout, after_marker)
+        assert after_marker in shell_output
+
+        await asyncio.wait_for(process.wait(), timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_late_client_stdin_after_exec_exit_does_not_drop_connection(proxy_server) -> None:
+    async with asyncssh.connect(
+        proxy_server.host,
+        proxy_server.port,
+        username=proxy_server.username,
+        password=proxy_server.password,
+        known_hosts=None,
+        public_key_auth=False,
+        kbdint_auth=False,
+    ) as conn:
+        process = await conn.create_process("sleep 0.05", term_type="xterm", encoding="utf-8", send_eof=False)
+
+        async def spam_stdin() -> None:
+            try:
+                for _ in range(64):
+                    process.stdin.write("runner-upload-data\n" * 128)
+                    await process.stdin.drain()
+                    await asyncio.sleep(0.01)
+            except (BrokenPipeError, ConnectionError, OSError):
+                pass
+            finally:
+                try:
+                    process.stdin.write_eof()
+                except (BrokenPipeError, ConnectionError, OSError):
+                    pass
+
+        await asyncio.gather(spam_stdin(), process.wait())
+
+        completed = await conn.run("printf still-alive", check=True, term_type="xterm")
+        assert completed.stdout == "still-alive"
+
+
+@pytest.mark.asyncio
+async def test_binary_upload_survives_parallel_probe_channels(proxy_server) -> None:
+    remote_path = f"/tmp/proxy-parallel-upload-{time.time_ns()}.bin"
+    payload = (bytes(range(256)) * 8192)[:1_572_864]
+
+    async with asyncssh.connect(
+        proxy_server.host,
+        proxy_server.port,
+        username=proxy_server.username,
+        password=proxy_server.password,
+        known_hosts=None,
+        public_key_auth=False,
+        kbdint_auth=False,
+    ) as conn:
+        process = await conn.create_process(f"dd of={remote_path} status=none", encoding=None, send_eof=False)
+
+        async def upload() -> None:
+            chunk_size = 65536
+            for offset in range(0, len(payload), chunk_size):
+                process.stdin.write(payload[offset : offset + chunk_size])
+                await process.stdin.drain()
+                if offset == 262144:
+                    await asyncio.sleep(0.1)
+            process.stdin.write_eof()
+
+        async def probes() -> tuple[asyncssh.SSHCompletedProcess, asyncssh.SSHCompletedProcess]:
+            await asyncio.sleep(0.05)
+            return await asyncio.gather(
+                conn.run("/bin/sh -c 'uname -s || uname -o && uname -m'", check=True),
+                conn.run('cmd /c "set OS & set PROCESSOR_ARCHITECTURE"', check=False),
+            )
+
+        (_, dd_result), (uname_result, cmd_result) = await asyncio.gather(
+            asyncio.gather(upload(), process.wait(check=False)),
+            probes(),
+        )
+
+        assert dd_result.exit_status == 0
+        assert uname_result.stdout.strip().startswith("Linux")
+        assert cmd_result.exit_status == 127
+
+        size_result = await conn.run(f"wc -c < {remote_path}", check=True)
+        assert int(size_result.stdout.strip()) == len(payload)
 
 
 def test_unregister_rejects_new_auth(proxy_server, proxy_openssh_env) -> None:

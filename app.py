@@ -8,6 +8,7 @@ from pathlib import Path
 
 import asyncssh
 
+from asyncssh_compat import install_asyncssh_compat_patches
 from control import GatewayControlService
 from host_keys import ServerHostKeyManager
 from server import ProxyServerFactory
@@ -19,6 +20,9 @@ LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 LOG = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_SERVER_HOST_KEY = PROJECT_ROOT / "assets" / "server-host-key"
+
+
+install_asyncssh_compat_patches()
 
 
 def _server_port(server: asyncio.AbstractServer | None) -> int | None:
