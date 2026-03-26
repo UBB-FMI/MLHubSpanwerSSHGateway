@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import inspect
-import json
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 
+from control_crypto import ControlCryptoError, EncryptedControlCodec
 from user_auth import UserDirectory, UserRecord
 
 
@@ -25,33 +25,32 @@ class GatewayControlService:
         self._shared_secret = shared_secret
         self._directory = directory
         self._on_unregister = on_unregister
+        self._codec = EncryptedControlCodec(shared_secret)
 
     async def handle_client(self, reader, writer) -> None:
+        authenticated = False
         try:
             line = await reader.readline()
-            payload = self._parse_request_line(line)
+            if not line:
+                raise ControlRequestError("missing request payload")
+            payload = self._codec.decode(line)
+            authenticated = True
             response = await self.process_request(payload)
+        except ControlCryptoError as exc:
+            response = {"ok": False, "error": str(exc)}
         except ControlRequestError as exc:
             response = {"ok": False, "error": str(exc)}
         except Exception:
             LOG.exception("unexpected control channel failure")
             response = {"ok": False, "error": "internal server error"}
 
-        writer.write((json.dumps(response) + "\n").encode("utf-8"))
+        if authenticated:
+            writer.write(self._codec.encode(response))
+        else:
+            writer.write(self._codec.encode_plaintext(response))
         await writer.drain()
         writer.close()
         await writer.wait_closed()
-
-    def _parse_request_line(self, line: bytes) -> Mapping[str, object]:
-        if not line:
-            raise ControlRequestError("missing request payload")
-        try:
-            payload = json.loads(line.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ControlRequestError(f"invalid JSON payload: {exc}") from exc
-        if not isinstance(payload, dict):
-            raise ControlRequestError("control payload must be a JSON object")
-        return payload
 
     async def process_request(self, payload: Mapping[str, object]) -> dict[str, object]:
         if str(payload.get("secret", "")) != self._shared_secret:

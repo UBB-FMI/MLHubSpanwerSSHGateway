@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import getpass
-import json
 import os
 import socket
 import stat
@@ -17,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from app import serve
+from control_crypto import ControlCryptoError, EncryptedControlCodec
 import user_auth
 
 
@@ -94,8 +94,13 @@ def run(
 
 
 def send_control_request(host: str, port: int, payload: dict[str, object], timeout: float = 5.0) -> dict[str, object]:
+    secret = payload.get("secret")
+    if not isinstance(secret, str) or not secret:
+        raise AssertionError("control request payload must include a non-empty secret")
+
+    codec = EncryptedControlCodec(secret)
     with socket.create_connection((host, port), timeout=timeout) as sock:
-        sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+        sock.sendall(codec.encode(payload))
         sock.shutdown(socket.SHUT_WR)
         response = b""
         while not response.endswith(b"\n"):
@@ -106,7 +111,10 @@ def send_control_request(host: str, port: int, payload: dict[str, object], timeo
 
     if not response:
         raise AssertionError("control server returned no response")
-    return json.loads(response.decode("utf-8"))
+    try:
+        return codec.decode(response)
+    except ControlCryptoError:
+        return codec.decode_plaintext(response, description="control response")
 
 
 @dataclass(frozen=True, slots=True)

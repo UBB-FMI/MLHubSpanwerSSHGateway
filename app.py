@@ -122,7 +122,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--control-listen-host", default="0.0.0.0")
     parser.add_argument("--control-listen-port", default=2223, type=int)
-    parser.add_argument("--control-shared-secret", required=True)
+    parser.add_argument("--control-shared-secret", required=True, help="Shared secret used to encrypt and authenticate control channel messages.")
     parser.add_argument("--upstream-client-key", required=True)
     parser.add_argument("--upstream-known-hosts", default="", help="Ignored. Upstream host keys are always trusted.")
     parser.add_argument("--upstream-connect-timeout", default=DEFAULT_CONNECT_TIMEOUT, type=int)

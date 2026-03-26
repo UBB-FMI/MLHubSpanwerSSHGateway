@@ -68,21 +68,31 @@ On first startup, the server creates:
 
 ## Control Channel
 
-`MLHubSpawner` registers and unregisters users over a newline-delimited JSON TCP protocol.
+`MLHubSpawner` registers and unregisters users over a newline-delimited encrypted JSON TCP protocol.
 
-Register message:
+Authenticated requests and responses are wrapped in an encrypted envelope:
+
+```json
+{"version":1,"nonce":"<base64 nonce>","ciphertext":"<base64 ciphertext>"}
+```
+
+The gateway and `MLHubSpawner` derive an AES-GCM key from `--control-shared-secret`, so the shared secret is used to both authenticate and encrypt the control traffic. Use a long random secret.
+
+Malformed or unauthenticated requests receive a plaintext error response because the server cannot trust that the caller has the right key yet.
+
+Encrypted register payload contents:
 
 ```json
 {"secret":"shared-secret","action":"register","username":"md5_xxx","password":"OnlyLettersPasswordOnlyLettersAB","upstream_host":"10.0.0.5","upstream_port":22}
 ```
 
-Unregister message:
+Encrypted unregister payload contents:
 
 ```json
 {"secret":"shared-secret","action":"unregister","username":"md5_xxx"}
 ```
 
-Success response:
+Decrypted success response contents:
 
 ```json
 {"ok":true}

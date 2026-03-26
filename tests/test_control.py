@@ -54,7 +54,7 @@ def test_control_rejects_bad_secret(proxy_server) -> None:
     )
 
     assert response["ok"] is False
-    assert "invalid shared secret" in response["error"]
+    assert "invalid shared secret or encrypted payload" in response["error"]
 
 
 def test_control_rejects_malformed_json(proxy_server) -> None:
@@ -70,4 +70,29 @@ def test_control_rejects_malformed_json(proxy_server) -> None:
 
     parsed = json.loads(response.decode("utf-8"))
     assert parsed["ok"] is False
-    assert "invalid JSON payload" in parsed["error"]
+    assert "invalid control envelope" in parsed["error"]
+
+
+def test_control_rejects_plaintext_json_payload(proxy_server) -> None:
+    plaintext_payload = {
+        "secret": proxy_server.control_secret,
+        "action": "register",
+        "username": "md5_plaintext",
+        "password": "OnlyLettersPasswordOnlyLettersAB",
+        "upstream_host": "10.0.0.15",
+        "upstream_port": 22,
+    }
+
+    with socket.create_connection((proxy_server.host, proxy_server.control_port), timeout=5.0) as sock:
+        sock.sendall((json.dumps(plaintext_payload) + "\n").encode("utf-8"))
+        sock.shutdown(socket.SHUT_WR)
+        response = b""
+        while not response.endswith(b"\n"):
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+
+    parsed = json.loads(response.decode("utf-8"))
+    assert parsed["ok"] is False
+    assert "plaintext control payloads are not supported" in parsed["error"]
