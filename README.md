@@ -126,8 +126,8 @@ Proxy to upstream server:
 ## Files
 
 - [`app.py`](./app.py): repo-root runner for `python app.py`
-- [`app.py`](./app.py): SSH and control listener startup
 - [`control.py`](./control.py): control-channel protocol handling
+- [`app.py`](./app.py): SSH and control listener startup
 - [`server.py`](./server.py): inbound SSH auth flow and active connection tracking
 - [`session.py`](./session.py): shell/exec/subsystem relay logic
 - [`forwarding.py`](./forwarding.py): remote and direct TCP forwarding support

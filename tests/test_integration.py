@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-import asyncio
 import socket
 import subprocess
+import threading
 import time
 from contextlib import closing
 from pathlib import Path
 
-import asyncssh
+import paramiko
 import pytest
 
 from conftest import send_control_request
@@ -19,20 +19,100 @@ def allocate_port() -> int:
         return int(sock.getsockname()[1])
 
 
-async def _read_until(reader: asyncssh.SSHReader[str], marker: str, timeout: float = 5.0) -> str:
+def _connect_paramiko(proxy_server) -> paramiko.SSHClient:
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(
+        proxy_server.host,
+        port=proxy_server.port,
+        username=proxy_server.username,
+        password=proxy_server.password,
+        look_for_keys=False,
+        allow_agent=False,
+        timeout=10,
+        auth_timeout=10,
+        banner_timeout=10,
+    )
+    return client
+
+
+def _read_until(channel: paramiko.Channel, marker: str, timeout: float = 5.0) -> str:
     chunks: list[str] = []
     deadline = time.monotonic() + timeout
+    channel.settimeout(0.2)
 
     while time.monotonic() < deadline:
-        chunk = await asyncio.wait_for(reader.read(4096), timeout=deadline - time.monotonic())
+        try:
+            chunk = channel.recv(4096)
+        except socket.timeout:
+            continue
+
         if not chunk:
             raise AssertionError(f"stream closed before marker {marker!r} was seen; received={''.join(chunks)!r}")
-        chunks.append(chunk)
+
+        chunks.append(chunk.decode("utf-8", errors="replace"))
         joined = "".join(chunks)
         if marker in joined:
             return joined
 
     raise AssertionError(f"timed out waiting for marker {marker!r}; received={''.join(chunks)!r}")
+
+
+def _send_all(channel: paramiko.Channel, data: bytes) -> None:
+    view = memoryview(data)
+    channel.settimeout(0.2)
+
+    while view:
+        try:
+            sent = channel.send(view)
+        except socket.timeout:
+            continue
+
+        if sent <= 0:
+            raise BrokenPipeError("channel closed while sending")
+
+        view = view[sent:]
+
+
+def _run_transport_command(
+    transport: paramiko.Transport,
+    command: str,
+    *,
+    term_type: str | None = None,
+) -> tuple[str, str, int]:
+    channel = transport.open_session()
+    channel.settimeout(0.2)
+    if term_type is not None:
+        channel.get_pty(term=term_type)
+    channel.exec_command(command)
+
+    stdout_chunks: list[bytes] = []
+    stderr_chunks: list[bytes] = []
+
+    while True:
+        drained = False
+
+        while channel.recv_ready():
+            stdout_chunks.append(channel.recv(65536))
+            drained = True
+
+        while channel.recv_stderr_ready():
+            stderr_chunks.append(channel.recv_stderr(65536))
+            drained = True
+
+        if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
+            break
+
+        if not drained:
+            time.sleep(0.01)
+
+    exit_status = channel.recv_exit_status()
+    channel.close()
+    return (
+        b"".join(stdout_chunks).decode("utf-8", errors="replace"),
+        b"".join(stderr_chunks).decode("utf-8", errors="replace"),
+        exit_status,
+    )
 
 
 def test_ssh_exec_succeeds(
@@ -120,31 +200,37 @@ def test_binary_exec_upload_with_stdin(
         )
 
 
-@pytest.mark.asyncio
-async def test_bad_password_rejected(proxy_server) -> None:
-    with pytest.raises(asyncssh.PermissionDenied):
-        await asyncssh.connect(
+def test_bad_password_rejected(proxy_server) -> None:
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    with pytest.raises(paramiko.AuthenticationException):
+        client.connect(
             proxy_server.host,
-            proxy_server.port,
+            port=proxy_server.port,
             username=proxy_server.username,
             password="wrong-password",
-            known_hosts=None,
-            public_key_auth=False,
-            kbdint_auth=False,
+            look_for_keys=False,
+            allow_agent=False,
+            timeout=10,
+            auth_timeout=10,
+            banner_timeout=10,
         )
 
 
-@pytest.mark.asyncio
-async def test_unknown_username_is_closed_immediately(proxy_server) -> None:
-    with pytest.raises((asyncssh.PermissionDenied, asyncssh.DisconnectError, ConnectionResetError, OSError)):
-        await asyncssh.connect(
+def test_unknown_username_is_closed_immediately(proxy_server) -> None:
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    with pytest.raises((paramiko.AuthenticationException, paramiko.SSHException, EOFError, ConnectionResetError, OSError)):
+        client.connect(
             proxy_server.host,
-            proxy_server.port,
+            port=proxy_server.port,
             username="md5_unknown",
             password="wrong-password",
-            known_hosts=None,
-            public_key_auth=False,
-            kbdint_auth=False,
+            look_for_keys=False,
+            allow_agent=False,
+            timeout=10,
+            auth_timeout=10,
+            banner_timeout=10,
         )
 
 
@@ -338,182 +424,203 @@ def test_remote_port_forwarding(
         forward_proc.wait(timeout=5)
 
 
-@pytest.mark.asyncio
-async def test_multiple_channels_share_one_connection(proxy_server) -> None:
-    async with asyncssh.connect(
-        proxy_server.host,
-        proxy_server.port,
-        username=proxy_server.username,
-        password=proxy_server.password,
-        known_hosts=None,
-        public_key_auth=False,
-        kbdint_auth=False,
-    ) as conn:
-        first, second = await asyncio.gather(
-            conn.run("printf first", check=True),
-            conn.run("printf second", check=True),
-        )
+def test_multiple_channels_share_one_connection(proxy_server) -> None:
+    client = _connect_paramiko(proxy_server)
+    try:
+        transport = client.get_transport()
+        assert transport is not None
 
-    assert first.stdout == "first"
-    assert second.stdout == "second"
+        first_channel = transport.open_session()
+        second_channel = transport.open_session()
+        first_channel.exec_command("printf first")
+        second_channel.exec_command("printf second")
+
+        first = first_channel.recv(64).decode("utf-8", errors="replace")
+        second = second_channel.recv(64).decode("utf-8", errors="replace")
+        assert first_channel.recv_exit_status() == 0
+        assert second_channel.recv_exit_status() == 0
+        assert first == "first"
+        assert second == "second"
+    finally:
+        client.close()
 
 
-@pytest.mark.asyncio
-async def test_interactive_shell_survives_parallel_execs(proxy_server) -> None:
-    async with asyncssh.connect(
-        proxy_server.host,
-        proxy_server.port,
-        username=proxy_server.username,
-        password=proxy_server.password,
-        known_hosts=None,
-        public_key_auth=False,
-        kbdint_auth=False,
-    ) as conn:
-        process = await conn.create_process(term_type="xterm", encoding="utf-8")
+def test_interactive_shell_survives_parallel_execs(proxy_server) -> None:
+    client = _connect_paramiko(proxy_server)
+    try:
+        transport = client.get_transport()
+        assert transport is not None
+
+        shell = transport.open_session()
+        shell.get_pty(term="xterm")
+        shell.invoke_shell()
 
         ready_marker = f"shell-ready-{time.time_ns()}"
-        process.stdin.write(f"printf '{ready_marker}\\n'\n")
-        await process.stdin.drain()
-        await _read_until(process.stdout, ready_marker)
+        shell.send(f"printf '{ready_marker}\\n'\n")
+        assert ready_marker in _read_until(shell, ready_marker)
 
-        first, second = await asyncio.gather(
-            conn.run("printf first", check=True, term_type="xterm"),
-            conn.run("printf second", check=True, term_type="xterm"),
-        )
+        first_result: list[tuple[str, str, int]] = []
+        second_result: list[tuple[str, str, int]] = []
 
-        assert first.stdout == "first"
-        assert second.stdout == "second"
+        def run_first() -> None:
+            first_result.append(_run_transport_command(transport, "printf first", term_type="xterm"))
+
+        def run_second() -> None:
+            second_result.append(_run_transport_command(transport, "printf second", term_type="xterm"))
+
+        first_thread = threading.Thread(target=run_first, daemon=True)
+        second_thread = threading.Thread(target=run_second, daemon=True)
+        first_thread.start()
+        second_thread.start()
+        first_thread.join(timeout=10)
+        second_thread.join(timeout=10)
+
+        assert first_result == [("first", "", 0)]
+        assert second_result == [("second", "", 0)]
 
         after_marker = f"shell-after-{time.time_ns()}"
-        process.stdin.write(f"printf '{after_marker}\\n'\nexit\n")
-        await process.stdin.drain()
-        shell_output = await _read_until(process.stdout, after_marker)
+        shell.send(f"printf '{after_marker}\\n'\nexit\n")
+        shell_output = _read_until(shell, after_marker)
         assert after_marker in shell_output
+        assert shell.recv_exit_status() == 0
+    finally:
+        client.close()
 
-        await asyncio.wait_for(process.wait(), timeout=5)
 
+def test_late_client_stdin_after_exec_exit_does_not_drop_connection(proxy_server) -> None:
+    client = _connect_paramiko(proxy_server)
+    try:
+        transport = client.get_transport()
+        assert transport is not None
 
-@pytest.mark.asyncio
-async def test_late_client_stdin_after_exec_exit_does_not_drop_connection(proxy_server) -> None:
-    async with asyncssh.connect(
-        proxy_server.host,
-        proxy_server.port,
-        username=proxy_server.username,
-        password=proxy_server.password,
-        known_hosts=None,
-        public_key_auth=False,
-        kbdint_auth=False,
-    ) as conn:
-        process = await conn.create_process("sleep 0.05", term_type="xterm", encoding="utf-8", send_eof=False)
+        channel = transport.open_session()
+        channel.settimeout(0.2)
+        channel.get_pty(term="xterm")
+        channel.exec_command("sleep 0.05")
 
-        async def spam_stdin() -> None:
+        try:
+            for _ in range(64):
+                _send_all(channel, ("runner-upload-data\n" * 128).encode("utf-8"))
+                time.sleep(0.01)
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+        finally:
             try:
-                for _ in range(64):
-                    process.stdin.write("runner-upload-data\n" * 128)
-                    await process.stdin.drain()
-                    await asyncio.sleep(0.01)
-            except (BrokenPipeError, ConnectionError, OSError):
+                channel.shutdown_write()
+            except Exception:
                 pass
-            finally:
-                try:
-                    process.stdin.write_eof()
-                except (BrokenPipeError, ConnectionError, OSError):
-                    pass
 
-        await asyncio.gather(spam_stdin(), process.wait())
+        assert channel.recv_exit_status() == 0
 
-        completed = await conn.run("printf still-alive", check=True, term_type="xterm")
-        assert completed.stdout == "still-alive"
+        stdout, _, status = _run_transport_command(transport, "printf still-alive", term_type="xterm")
+        assert status == 0
+        assert stdout == "still-alive"
+    finally:
+        client.close()
 
 
-@pytest.mark.asyncio
-async def test_binary_upload_survives_parallel_probe_channels(proxy_server) -> None:
+def test_binary_upload_survives_parallel_probe_channels(proxy_server) -> None:
     remote_path = f"/tmp/proxy-parallel-upload-{time.time_ns()}.bin"
     payload = (bytes(range(256)) * 8192)[:1_572_864]
+    client = _connect_paramiko(proxy_server)
+    try:
+        transport = client.get_transport()
+        assert transport is not None
 
-    async with asyncssh.connect(
-        proxy_server.host,
-        proxy_server.port,
-        username=proxy_server.username,
-        password=proxy_server.password,
-        known_hosts=None,
-        public_key_auth=False,
-        kbdint_auth=False,
-    ) as conn:
-        process = await conn.create_process(f"dd of={remote_path} status=none", encoding=None, send_eof=False)
+        upload_channel = transport.open_session()
+        upload_channel.settimeout(0.2)
+        upload_channel.exec_command(f"dd of={remote_path} status=none")
+        upload_error: list[BaseException] = []
 
-        async def upload() -> None:
-            chunk_size = 65536
-            for offset in range(0, len(payload), chunk_size):
-                process.stdin.write(payload[offset : offset + chunk_size])
-                await process.stdin.drain()
-                if offset == 262144:
-                    await asyncio.sleep(0.1)
-            process.stdin.write_eof()
+        def upload() -> None:
+            try:
+                chunk_size = 65536
+                for offset in range(0, len(payload), chunk_size):
+                    _send_all(upload_channel, payload[offset : offset + chunk_size])
+                    if offset == 262144:
+                        time.sleep(0.1)
+                upload_channel.shutdown_write()
+            except BaseException as exc:  # noqa: BLE001
+                upload_error.append(exc)
 
-        async def probes() -> tuple[asyncssh.SSHCompletedProcess, asyncssh.SSHCompletedProcess]:
-            await asyncio.sleep(0.05)
-            return await asyncio.gather(
-                conn.run("/bin/sh -c 'uname -s || uname -o && uname -m'", check=True),
-                conn.run('cmd /c "set OS & set PROCESSOR_ARCHITECTURE"', check=False),
-            )
+        upload_thread = threading.Thread(target=upload, daemon=True)
+        upload_thread.start()
+        time.sleep(0.05)
 
-        (_, dd_result), (uname_result, cmd_result) = await asyncio.gather(
-            asyncio.gather(upload(), process.wait(check=False)),
-            probes(),
+        uname_stdout, _, uname_status = _run_transport_command(
+            transport,
+            "/bin/sh -c 'uname -s || uname -o && uname -m'",
+        )
+        _, _, cmd_status = _run_transport_command(
+            transport,
+            'cmd /c "set OS & set PROCESSOR_ARCHITECTURE"',
         )
 
-        assert dd_result.exit_status == 0
-        assert uname_result.stdout.strip().startswith("Linux")
-        assert cmd_result.exit_status == 127
+        upload_thread.join(timeout=10)
+        assert not upload_thread.is_alive()
+        assert not upload_error, upload_error[0] if upload_error else None
+        assert upload_channel.recv_exit_status() == 0
+        assert uname_status == 0
+        assert uname_stdout.strip().startswith("Linux")
+        assert cmd_status == 127
 
-        size_result = await conn.run(f"wc -c < {remote_path}", check=True)
-        assert int(size_result.stdout.strip()) == len(payload)
+        size_stdout, _, size_status = _run_transport_command(transport, f"wc -c < {remote_path}")
+        assert size_status == 0
+        assert int(size_stdout.strip()) == len(payload)
+    finally:
+        client.close()
 
 
-@pytest.mark.asyncio
-async def test_large_binary_upload_crosses_window_with_parallel_probe_channels(proxy_server) -> None:
+def test_large_binary_upload_crosses_window_with_parallel_probe_channels(proxy_server) -> None:
     remote_path = f"/tmp/proxy-large-parallel-upload-{time.time_ns()}.bin"
     payload = (bytes(range(256)) * 12288)[:2_621_440]
+    client = _connect_paramiko(proxy_server)
+    try:
+        transport = client.get_transport()
+        assert transport is not None
 
-    async with asyncssh.connect(
-        proxy_server.host,
-        proxy_server.port,
-        username=proxy_server.username,
-        password=proxy_server.password,
-        known_hosts=None,
-        public_key_auth=False,
-        kbdint_auth=False,
-    ) as conn:
-        process = await conn.create_process(f"dd of={remote_path} status=none", encoding=None, send_eof=False)
+        upload_channel = transport.open_session()
+        upload_channel.settimeout(0.2)
+        upload_channel.exec_command(f"dd of={remote_path} status=none")
+        upload_error: list[BaseException] = []
 
-        async def upload() -> None:
-            chunk_size = 65536
-            for offset in range(0, len(payload), chunk_size):
-                process.stdin.write(payload[offset : offset + chunk_size])
-                await process.stdin.drain()
-                if offset in {262144, 1310720}:
-                    await asyncio.sleep(0.1)
-            process.stdin.write_eof()
+        def upload() -> None:
+            try:
+                chunk_size = 65536
+                for offset in range(0, len(payload), chunk_size):
+                    _send_all(upload_channel, payload[offset : offset + chunk_size])
+                    if offset in {262144, 1310720}:
+                        time.sleep(0.1)
+                upload_channel.shutdown_write()
+            except BaseException as exc:  # noqa: BLE001
+                upload_error.append(exc)
 
-        async def probes() -> tuple[asyncssh.SSHCompletedProcess, asyncssh.SSHCompletedProcess]:
-            await asyncio.sleep(0.05)
-            return await asyncio.gather(
-                conn.run("/bin/sh -c 'uname -s || uname -o && uname -m'", check=True),
-                conn.run('cmd /c "set OS & set PROCESSOR_ARCHITECTURE"', check=False),
-            )
+        upload_thread = threading.Thread(target=upload, daemon=True)
+        upload_thread.start()
+        time.sleep(0.05)
 
-        (_, dd_result), (uname_result, cmd_result) = await asyncio.gather(
-            asyncio.gather(upload(), process.wait(check=False)),
-            probes(),
+        uname_stdout, _, uname_status = _run_transport_command(
+            transport,
+            "/bin/sh -c 'uname -s || uname -o && uname -m'",
+        )
+        _, _, cmd_status = _run_transport_command(
+            transport,
+            'cmd /c "set OS & set PROCESSOR_ARCHITECTURE"',
         )
 
-        assert dd_result.exit_status == 0
-        assert uname_result.stdout.strip().startswith("Linux")
-        assert cmd_result.exit_status == 127
+        upload_thread.join(timeout=15)
+        assert not upload_thread.is_alive()
+        assert not upload_error, upload_error[0] if upload_error else None
+        assert upload_channel.recv_exit_status() == 0
+        assert uname_status == 0
+        assert uname_stdout.strip().startswith("Linux")
+        assert cmd_status == 127
 
-        size_result = await conn.run(f"wc -c < {remote_path}", check=True)
-        assert int(size_result.stdout.strip()) == len(payload)
+        size_stdout, _, size_status = _run_transport_command(transport, f"wc -c < {remote_path}")
+        assert size_status == 0
+        assert int(size_stdout.strip()) == len(payload)
+    finally:
+        client.close()
 
 
 def test_unregister_rejects_new_auth(proxy_server, proxy_openssh_env) -> None:

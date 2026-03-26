@@ -12,7 +12,7 @@ from forwarding import DirectTCPBridge, RemotePortForwarder, ReverseTCPListener
 from session import PendingSessionRequest, SessionBridge
 from ssh_common import SESSION_CHANNEL_WINDOW, close_channel_quietly, close_socket_quietly, close_transport_quietly
 from upstream import UpstreamConnectionFactory, UpstreamSSHConnection
-from user_auth import UnknownUserError, UserAuthError, UserAuthenticator, UserRecord
+from user_auth import UnknownUserError, UserAuthError, UserAuthenticator
 
 
 LOG = logging.getLogger(__name__)
@@ -162,7 +162,6 @@ class ProxySSHConnection:
         self._transport: paramiko.Transport | None = None
         self._server_interface = ProxyServerInterface(self)
         self._username: str | None = None
-        self._user_record: UserRecord | None = None
         self._upstream_conn: UpstreamSSHConnection | None = None
         self._pending_sessions: dict[int, PendingSessionRequest] = {}
         self._pending_direct_tcp: dict[int, DirectTCPRequest] = {}
@@ -225,7 +224,6 @@ class ProxySSHConnection:
 
         with self._lock:
             self._username = username
-            self._user_record = user
             self._upstream_conn = upstream_conn
 
         self._active_connections.register(username, self)
